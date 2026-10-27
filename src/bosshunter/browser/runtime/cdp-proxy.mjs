@@ -145,7 +145,22 @@ function probeDevtoolsWsPath(port, wsPath, timeoutMs = 5000) {
   });
 }
 
-async function discoverChromePort() {
+// Collect EVERY usable Chrome debug candidate instead of stopping at the first
+// port whose /json/version answers. A port can look healthy at the HTTP level
+// and still refuse or hang the DevTools WebSocket upgrade (a stale
+// DevToolsActivePort entry, a browser that is shutting down, or a second
+// debugging-enabled profile). Returning the first candidate wedged the runtime
+// forever: every request reused that dead candidate while a perfectly good
+// Chrome sat on another configured port.
+async function discoverCandidates() {
+  const candidates = [];
+  const seen = new Set();
+  const add = (candidate) => {
+    if (!candidate || !candidate.wsUrl || seen.has(candidate.wsUrl)) return;
+    seen.add(candidate.wsUrl);
+    candidates.push(candidate);
+  };
+
   for (const filePath of activePortFiles()) {
     try {
       const lines = fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/).filter(Boolean);
@@ -169,7 +184,7 @@ async function discoverChromePort() {
             ? 'Google Chrome Canary'
             : 'Google Chrome';
         console.log(`[BossHunter Browser Runtime] DevToolsActivePort: ${port}${wsPath ? ' with wsPath' : ''}`);
-        return { port, wsPath, wsUrl, product: version?.Browser || null, browserName };
+        add({ port, wsPath, wsUrl, product: version?.Browser || null, browserName });
       }
     } catch {}
   }
@@ -181,11 +196,58 @@ async function discoverChromePort() {
         const product = version.Browser || null;
         const browserName = browserNameFromProduct(product) || '未知浏览器';
         console.log(`[BossHunter Browser Runtime] Found Chrome debug port: ${port}`);
-        return { port, wsUrl: version.webSocketDebuggerUrl, product, browserName };
+        add({ port, wsUrl: version.webSocketDebuggerUrl, product, browserName });
       }
     }
   }
-  return null;
+
+  return candidates;
+}
+
+// Open one candidate's DevTools socket and resolve only once the upgrade
+// completes. A handshake that never finishes must fail fast (instead of hanging
+// every later request on a pending connect() promise), and a candidate that
+// fails must not clear the state of a previously working connection.
+function openDevtoolsSocket(candidate, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    let socket;
+    try {
+      socket = new WS(candidate.wsUrl);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      detach();
+      if (error) {
+        try { socket.close(); } catch {}
+        reject(error);
+      } else {
+        resolve(socket);
+      }
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`WebSocket handshake timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    const onOpen = () => finish(null);
+    const onError = (event) => finish(new Error(event.message || event.error?.message || 'connection failed'));
+    const detach = () => {
+      socket.removeEventListener?.('open', onOpen);
+      socket.removeEventListener?.('error', onError);
+    };
+    if (socket.on) {
+      socket.on('open', onOpen);
+      socket.on('error', onError);
+    } else {
+      socket.addEventListener('open', onOpen);
+      socket.addEventListener('error', onError);
+    }
+  });
 }
 
 function getWebSocketUrl(port, wsPath, wsUrl) {
@@ -194,31 +256,110 @@ function getWebSocketUrl(port, wsPath, wsUrl) {
   return null;
 }
 
+function resetChromeState() {
+  ws = null;
+  chromePort = null;
+  chromeWsPath = null;
+  chromeWsUrl = null;
+  chromeProduct = null;
+  chromeName = null;
+  sessions.clear();
+  portGuardedSessions.clear();
+}
+
+function wireSocket() {
+  const socket = ws;
+  const onError = (event) => {
+    console.error('[BossHunter Browser Runtime] Connection error:', event.message || event.error?.message || 'connection failed');
+    if (ws !== socket) return;
+    resetChromeState();
+  };
+  const onClose = () => {
+    console.log('[BossHunter Browser Runtime] Chrome connection closed');
+    if (ws !== socket) return;
+    resetChromeState();
+  };
+  const onMessage = (event) => {
+    const data = typeof event === 'string' ? event : (event.data || event);
+    const text = typeof data === 'string' ? data : data.toString();
+    const msg = JSON.parse(text);
+
+    if (msg.method === 'Target.attachedToTarget') {
+      const { sessionId, targetInfo } = msg.params;
+      sessions.set(targetInfo.targetId, sessionId);
+    }
+    if (msg.method === 'Fetch.requestPaused') {
+      const { requestId, sessionId } = msg.params;
+      sendCDP('Fetch.failRequest', { requestId, errorReason: 'ConnectionRefused' }, sessionId).catch(() => {});
+    }
+    if (msg.id && pending.has(msg.id)) {
+      const { resolve, timer } = pending.get(msg.id);
+      clearTimeout(timer);
+      pending.delete(msg.id);
+      resolve(msg);
+    }
+  };
+
+  if (socket.on) {
+    socket.on('close', onClose);
+    socket.on('error', onError);
+    socket.on('message', onMessage);
+  } else {
+    socket.addEventListener('close', onClose);
+    socket.addEventListener('error', onError);
+    socket.addEventListener('message', onMessage);
+  }
+}
+
 async function connect() {
   if (ws && (ws.readyState === WS.OPEN || ws.readyState === 1)) return;
   if (connectingPromise) return connectingPromise;
 
-  if (!chromePort) {
-    const discovered = await discoverChromePort();
-    if (!discovered) {
+  connectingPromise = (async () => {
+    const candidates = [];
+    if (chromePort) {
+      const cachedWsUrl = getWebSocketUrl(chromePort, chromeWsPath, chromeWsUrl);
+      if (cachedWsUrl) {
+        candidates.push({
+          port: chromePort,
+          wsPath: chromeWsPath,
+          wsUrl: cachedWsUrl,
+          product: chromeProduct,
+          browserName: chromeName,
+        });
+      }
+    }
+    for (const candidate of await discoverCandidates()) {
+      if (!candidates.some((item) => item.wsUrl === candidate.wsUrl)) candidates.push(candidate);
+    }
+    if (!candidates.length) {
       throw new Error('Chrome debug port not found. Open Chrome remote debugging or start Chrome with --remote-debugging-port=9222.');
     }
-    chromePort = discovered.port;
-    chromeWsPath = discovered.wsPath || null;
-    chromeWsUrl = discovered.wsUrl || null;
-    chromeProduct = discovered.product || null;
-    chromeName = discovered.browserName || null;
-  }
 
-  const wsUrl = getWebSocketUrl(chromePort, chromeWsPath, chromeWsUrl);
-  if (!wsUrl) throw new Error('Chrome browser WebSocket URL not found. Check Chrome remote debugging permissions.');
-  connectingPromise = new Promise((resolve, reject) => {
-    ws = new WS(wsUrl);
-
-    const onOpen = () => {
-      cleanup();
-      connectingPromise = null;
-      console.log(`[BossHunter Browser Runtime] Connected to Chrome port ${chromePort}`);
+    // Walk every candidate until one really completes the DevTools handshake.
+    // This is what keeps a dead-but-reachable debug port from pinning the
+    // runtime forever while a healthy Chrome waits on another port.
+    let lastError = null;
+    for (const candidate of candidates) {
+      let socket;
+      try {
+        socket = await openDevtoolsSocket(candidate);
+      } catch (error) {
+        lastError = error;
+        console.error(
+          `[BossHunter Browser Runtime] Chrome candidate on port ${candidate.port} failed:`,
+          error.message,
+        );
+        continue;
+      }
+      ws = socket;
+      chromePort = candidate.port;
+      chromeWsPath = candidate.wsPath || null;
+      chromeWsUrl = candidate.wsUrl || null;
+      chromeProduct = candidate.product || null;
+      chromeName = candidate.browserName || null;
+      wireSocket();
+      console.log(`[BossHunter Browser Runtime] Connected to Chrome port ${candidate.port}`);
       // When Chrome only exposes the browser WebSocket there is no /json/version
       // to read the browser identity from, so ask CDP for what it would report.
       // The name may already be known from the profile path; the product is not.
@@ -233,69 +374,13 @@ async function connect() {
           })
           .catch(() => {});
       }
-      resolve();
-    };
-    const onError = (event) => {
-      cleanup();
-      connectingPromise = null;
-      ws = null;
-      chromePort = null;
-      chromeWsPath = null;
-      chromeWsUrl = null;
-      chromeProduct = null;
-      chromeName = null;
-      const msg = event.message || event.error?.message || 'connection failed';
-      console.error('[BossHunter Browser Runtime] Connection error:', msg);
-      reject(new Error(msg));
-    };
-    const onClose = () => {
-      console.log('[BossHunter Browser Runtime] Chrome connection closed');
-      ws = null;
-      chromePort = null;
-      chromeWsPath = null;
-      chromeWsUrl = null;
-      chromeProduct = null;
-      chromeName = null;
-      sessions.clear();
-      portGuardedSessions.clear();
-    };
-    const onMessage = (event) => {
-      const data = typeof event === 'string' ? event : (event.data || event);
-      const text = typeof data === 'string' ? data : data.toString();
-      const msg = JSON.parse(text);
-
-      if (msg.method === 'Target.attachedToTarget') {
-        const { sessionId, targetInfo } = msg.params;
-        sessions.set(targetInfo.targetId, sessionId);
-      }
-      if (msg.method === 'Fetch.requestPaused') {
-        const { requestId, sessionId } = msg.params;
-        sendCDP('Fetch.failRequest', { requestId, errorReason: 'ConnectionRefused' }, sessionId).catch(() => {});
-      }
-      if (msg.id && pending.has(msg.id)) {
-        const { resolve, timer } = pending.get(msg.id);
-        clearTimeout(timer);
-        pending.delete(msg.id);
-        resolve(msg);
-      }
-    };
-
-    function cleanup() {
-      ws.removeEventListener?.('open', onOpen);
-      ws.removeEventListener?.('error', onError);
+      return;
     }
 
-    if (ws.on) {
-      ws.on('open', onOpen);
-      ws.on('error', onError);
-      ws.on('close', onClose);
-      ws.on('message', onMessage);
-    } else {
-      ws.addEventListener('open', onOpen);
-      ws.addEventListener('error', onError);
-      ws.addEventListener('close', onClose);
-      ws.addEventListener('message', onMessage);
-    }
+    resetChromeState();
+    throw new Error(`Chrome connection failed: ${lastError?.message || 'unknown error'}`);
+  })().finally(() => {
+    connectingPromise = null;
   });
 
   return connectingPromise;

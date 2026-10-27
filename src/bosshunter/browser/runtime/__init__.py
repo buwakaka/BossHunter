@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from importlib.resources import files
 from pathlib import Path
@@ -232,21 +233,71 @@ def _runtime_env(config: dict[str, Any] | None = None) -> dict[str, str]:
     return env
 
 
+def get_runtime_log_path() -> Path:
+    """Return the log that captures the Browser Runtime's own stderr.
+
+    The runtime is started detached, so without this file its crash or Chrome
+    connection errors are invisible and a failed start looks like "nothing
+    happened" to the user.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else _safe_home()
+        return root / "BossHunter" / "logs" / "browser-runtime.log"
+    state = os.environ.get("XDG_STATE_HOME")
+    root = Path(state) if state else _safe_home() / ".local" / "state"
+    return root / "bosshunter" / "browser-runtime.log"
+
+
+def _safe_home() -> Path:
+    try:
+        return Path.home()
+    except (OSError, RuntimeError):
+        return Path(tempfile.gettempdir())
+
+
+def _open_runtime_log() -> Any:
+    """Open the runtime log for append, truncating it when it grows too large."""
+    path = get_runtime_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if path.exists() and path.stat().st_size > 1_000_000:
+            path.unlink()
+    except OSError:
+        pass
+    return path.open("ab")
+
+
 def start_runtime(config: dict[str, Any] | None = None, node_executable: str = "node") -> subprocess.Popen:
     """Start the bundled Node.js browser runtime."""
     global _runtime_process
     script_path = get_runtime_script_path()
+    log = None
     kwargs: dict[str, Any] = {
         "env": _runtime_env(config),
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
     }
+    # Keep the runtime's diagnostics instead of discarding them: a start failure
+    # is otherwise indistinguishable from a healthy idle runtime.
+    try:
+        log = _open_runtime_log()
+    except OSError:
+        log = None
+    if log is not None:
+        kwargs["stdout"] = log
+        kwargs["stderr"] = subprocess.STDOUT
+    else:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
-    _runtime_process = subprocess.Popen([node_executable, str(script_path)], **kwargs)
+    try:
+        _runtime_process = subprocess.Popen([node_executable, str(script_path)], **kwargs)
+    finally:
+        if log is not None:
+            log.close()
     return _runtime_process
 
 
@@ -298,6 +349,7 @@ __all__ = [
     "get_browser_config",
     "get_runtime_url",
     "get_runtime_script_path",
+    "get_runtime_log_path",
     "check_node_available",
     "runtime_health",
     "is_bosshunter_runtime",

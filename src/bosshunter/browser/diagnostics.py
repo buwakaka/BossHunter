@@ -9,7 +9,14 @@ import httpx
 from rich.console import Console
 
 from bosshunter.browser import evaluate, find_boss_tab, find_zhilian_tab
-from bosshunter.browser.runtime import check_node_available, ensure_runtime, get_runtime_url, runtime_health, runtime_targets
+from bosshunter.browser.runtime import (
+    check_node_available,
+    ensure_runtime,
+    get_runtime_log_path,
+    get_runtime_url,
+    runtime_health,
+    runtime_targets,
+)
 
 
 ZHILIAN_PAGE_STATE_SCRIPT = """
@@ -144,6 +151,7 @@ def print_browser_diagnostics(config: dict[str, Any] | None = None, console: Con
         out.print(f"[red]✗[/red] BossHunter CDP Runtime 未就绪: {result['runtime_url']}")
         if any("non-BossHunter" in error for error in result["errors"]):
             out.print("  端口已被非 BossHunter 服务占用，请停止旧的 CDP Proxy 或在 config.yaml 中修改 browser.proxy_port。")
+        out.print(f"  运行日志: {get_runtime_log_path()}")
 
     if result["chrome"]:
         out.print("[green]✓[/green] 已连接 Chrome")

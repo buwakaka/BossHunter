@@ -213,6 +213,62 @@ class _FakeCdp:
             self._server.close()
 
 
+class _RejectingWsCdp:
+    """Advertises a DevTools WebSocket URL but refuses every upgrade.
+
+    This is the shape that wedged the runtime: ``/json/version`` answers, so
+    discovery used to trust the port, but the browser-level socket never opens
+    (a stale DevToolsActivePort entry, a browser mid-shutdown, ...). The runtime
+    must walk on to the next configured candidate instead of failing forever.
+    """
+
+    def __init__(self):
+        self._server = socket.socket()
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(8)
+        self.port = int(self._server.getsockname()[1])
+        self._stop = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        with contextlib.suppress(OSError):
+            conn.settimeout(5)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            if b"upgrade" in data.lower():
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            body = json.dumps({
+                "Browser": "Chrome/124.0.0.0",
+                "Protocol-Version": "1.3",
+                "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/browser/reject",
+            }).encode()
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+            )
+        with contextlib.suppress(OSError):
+            conn.close()
+
+    def close(self):
+        self._stop.set()
+        with contextlib.suppress(OSError):
+            self._server.close()
+
+
 class _DecoyTcpServer:
     """Accepts TCP and answers with a body that is not a DevTools JSON document."""
 
@@ -283,16 +339,12 @@ class BrowserRuntimeDiscoveryTests(unittest.TestCase):
         self.decoy.close()
         self.tmp.cleanup()
 
-    def _start_proxy_with_active_port_file(self, content, chrome_ports=None):
-        port_file = _devtools_active_port_path(self.home)
-        port_file.parent.mkdir(parents=True, exist_ok=True)
-        port_file.write_text(content, encoding="utf-8")
-
+    def _spawn_proxy(self, chrome_ports):
         env = os.environ.copy()
         env["HOME"] = str(self.home)
         env["LOCALAPPDATA"] = str(self.home)
         env["BOSSHUNTER_BROWSER_PROXY_PORT"] = str(self.proxy_port)
-        env["BOSSHUNTER_CHROME_PORTS"] = str(chrome_ports if chrome_ports is not None else self.fake.port)
+        env["BOSSHUNTER_CHROME_PORTS"] = str(chrome_ports)
         env["BOSSHUNTER_ENABLE_PORT_GUARD"] = "false"
         self.process = subprocess.Popen(
             [self.node, str(PROXY_SCRIPT)],
@@ -301,6 +353,12 @@ class BrowserRuntimeDiscoveryTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
         )
+
+    def _start_proxy_with_active_port_file(self, content, chrome_ports=None):
+        port_file = _devtools_active_port_path(self.home)
+        port_file.parent.mkdir(parents=True, exist_ok=True)
+        port_file.write_text(content, encoding="utf-8")
+        self._spawn_proxy(chrome_ports if chrome_ports is not None else self.fake.port)
 
     def _start_proxy_with_stale_port_file(self):
         # What a stale file looks like: a live port that does not speak CDP.
@@ -360,6 +418,18 @@ class BrowserRuntimeDiscoveryTests(unittest.TestCase):
         self.assertEqual(health["chromePort"], self.fake.port)
         self.assertEqual(health["connected"], True)
         self.assertEqual(health["browserProduct"], "Chrome/124.0.0.0")
+
+    def test_refused_ws_candidate_falls_through_to_next_port(self):
+        """A reachable but non-upgradable candidate must not pin the runtime."""
+        rejecting = _RejectingWsCdp()
+        self.addCleanup(rejecting.close)
+        self._spawn_proxy(f"{rejecting.port},{self.fake.port}")
+        base = self._wait_for_targets()
+
+        _, health = _http_json(base + "/health")
+        self.assertEqual(health["runtime"], "bosshunter")
+        self.assertEqual(health["connected"], True)
+        self.assertEqual(health["chromePort"], self.fake.port)
 
     def test_decoy_port_is_not_a_devtools_endpoint(self):
         """Keep the fixture honest: the decoy must fail the /json/version probe."""
