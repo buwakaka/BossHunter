@@ -279,5 +279,24 @@ class BrowserPreflightTests(unittest.TestCase):
 		self.assertIn("要求登录", login_check["message"])
 
 
+	@patch("bosshunter.web.preflight.check_ai_connection")
+	@patch("bosshunter.web.preflight.check_browser_connection")
+	def test_platform_keywords_satisfy_search_check(self, browser_check, ai_check):
+		"""Keywords saved per platform by the Web UI must count as configured."""
+		ai_check.return_value = []
+		browser_check.return_value = []
+		config = {
+			"platforms": {
+				"boss": {"enabled": True, "search": {"keywords": ["数据"]}},
+			},
+		}
+
+		checks = collect_preflight_checks("full", config)
+
+		keyword_check = next(check for check in checks if check["id"] == "search_keywords")
+		self.assertEqual(keyword_check["status"], "pass")
+		self.assertIn("数据", keyword_check["detail"])
+
+
 if __name__ == "__main__":
 	unittest.main()

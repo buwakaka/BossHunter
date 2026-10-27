@@ -483,6 +483,10 @@ def _configuration_checks(mode: str, config: dict, options: dict | None = None) 
 			]
 		else:
 			keywords = config.get("search", {}).get("keywords") or []
+			if not keywords:
+				# The Web UI stores per-platform keywords; a global-only check
+				# wrongly told those users their search was not configured.
+				keywords = _configured_platform_keywords(config)
 		if not keywords:
 			checks.append(
 				_check(
@@ -505,6 +509,32 @@ def _configuration_checks(mode: str, config: dict, options: dict | None = None) 
 				)
 			)
 	return checks
+
+
+def _configured_platform_keywords(config: dict) -> list[str]:
+	"""Return keywords configured under ``platforms.<name>.search``.
+
+	The Web UI saves keywords per platform, while older configs used the global
+	``search.keywords`` list. Treat either shape as configured so the preflight
+	does not report a finished config as missing keywords.
+	"""
+	result: list[str] = []
+	platforms = config.get("platforms")
+	if not isinstance(platforms, dict):
+		return result
+	for platform, value in platforms.items():
+		if not isinstance(value, dict) or value.get("enabled") is False:
+			continue
+		search = value.get("search") if isinstance(value.get("search"), dict) else value
+		if not isinstance(search, dict):
+			continue
+		words = search.get("keywords")
+		if not isinstance(words, list):
+			continue
+		cleaned = [str(word).strip() for word in words if str(word).strip()]
+		if cleaned:
+			result.append(f"{platform}：{'、'.join(cleaned)}")
+	return result
 
 
 def _check(
